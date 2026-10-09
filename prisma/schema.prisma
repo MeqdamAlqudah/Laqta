@@ -1,0 +1,278 @@
+// LeadFlow data model (spec section 5).
+// Every business table carries organizationId -> every query is tenant-scoped.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  AGENT
+  VIEWER
+}
+
+enum LeadStatus {
+  NEW
+  ASSIGNED
+  CONTACTED
+  QUALIFIED
+  WON
+  LOST
+}
+
+enum ActivityType {
+  CREATED
+  DUPLICATE_MERGED
+  STATUS_CHANGED
+  OWNER_CHANGED
+  NOTE
+  CALL
+  MESSAGE
+  EMAIL_SENT
+  NOTIFICATION_SENT
+  SYNCED
+  AI_SUGGESTION
+  SLA_ESCALATED
+  ANONYMIZED
+}
+
+enum JobType {
+  SEND_CONFIRMATION
+  NOTIFY_STAFF
+  NOTIFY_WHATSAPP
+  SYNC_SHEET
+  AI_CLASSIFY
+  SLA_ESCALATION
+  DAILY_SUMMARY
+}
+
+enum JobState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  DEAD
+}
+
+enum IntegrationProvider {
+  EMAIL
+  SHEETS_WEBHOOK
+  WHATSAPP
+  AI
+}
+
+model Organization {
+  id              String   @id @default(cuid())
+  name            String
+  slug            String   @unique
+  timezone        String   @default("Asia/Amman")
+  defaultLanguage String   @default("en") @map("default_language")
+  // Public "origin key" sent by the website form (not a secret; identifies the tenant).
+  publicKey       String   @unique @map("public_key")
+  // Per-organization counter used to build human references (LF-2026-1042).
+  leadCounter     Int      @default(1000) @map("lead_counter")
+  // { slaMinutes, workingHours, dedupeWindowHours, retentionDays, notifyEmails }
+  settings        Json     @default("{}") @map("settings_json")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  users        User[]
+  services     Service[]
+  leads        Lead[]
+  jobs         AutomationJob[]
+  integrations Integration[]
+
+  @@map("organizations")
+}
+
+model User {
+  id             String    @id @default(cuid())
+  organizationId String    @map("organization_id")
+  name           String
+  email          String    @unique
+  passwordHash   String    @map("password_hash")
+  role           Role      @default(AGENT)
+  active         Boolean   @default(true)
+  lastLoginAt    DateTime? @map("last_login_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  organization Organization   @relation(fields: [organizationId], references: [id])
+  ownedLeads   Lead[]         @relation("LeadOwner")
+  activities   LeadActivity[]
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+model Service {
+  id             String    @id @default(cuid())
+  organizationId String    @map("organization_id")
+  code           String
+  nameEn         String    @map("name_en")
+  nameAr         String    @map("name_ar")
+  active         Boolean   @default(true)
+  // { "strategy": "round_robin" | "least_loaded" | "fixed", "userIds": [...] }
+  routingRule    Json      @default("{}") @map("routing_rule")
+  deletedAt      DateTime? @map("deleted_at") // soft delete for configuration records
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  leads        Lead[]
+
+  @@unique([organizationId, code])
+  @@map("services")
+}
+
+model Lead {
+  id             String     @id @default(cuid())
+  organizationId String     @map("organization_id")
+  reference      String
+  fullName       String     @map("full_name")
+  phoneE164      String?    @map("phone_e164")
+  email          String?
+  serviceId      String?    @map("service_id")
+  preferredAt    DateTime?  @map("preferred_at")
+  message        String?
+  language       String     @default("en")
+  status         LeadStatus @default(NEW)
+  ownerId        String?    @map("owner_id")
+  sourceChannel  String     @map("source_channel")
+  sourceCampaign String?    @map("source_campaign")
+  sourceMeta     Json       @default("{}") @map("source_meta") // utm_* etc.
+  idempotencyKey String     @map("idempotency_key")
+  // Optimistic locking: every update must send the version it read.
+  version        Int        @default(1)
+
+  slaDueAt         DateTime? @map("sla_due_at")
+  slaEscalatedAt   DateTime? @map("sla_escalated_at")
+  firstContactedAt DateTime? @map("first_contacted_at")
+
+  // AI suggestion (advisory only - never drives assignment).
+  aiCategory       String?   @map("ai_category")
+  aiPriority       String?   @map("ai_priority")
+  aiReason         String?   @map("ai_reason")
+  aiSuggestedReply String?   @map("ai_suggested_reply")
+  aiProvider       String?   @map("ai_provider")
+
+  anonymizedAt DateTime? @map("anonymized_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  organization Organization    @relation(fields: [organizationId], references: [id])
+  service      Service?        @relation(fields: [serviceId], references: [id])
+  owner        User?           @relation("LeadOwner", fields: [ownerId], references: [id])
+  activities   LeadActivity[]
+  jobs         AutomationJob[]
+  consents     Consent[]
+
+  @@unique([organizationId, idempotencyKey])
+  @@unique([organizationId, reference])
+  @@index([organizationId, status])
+  @@index([organizationId, ownerId])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, phoneE164])
+  @@index([organizationId, email])
+  @@map("leads")
+}
+
+// Immutable audit trail: rows are only ever inserted.
+model LeadActivity {
+  id        String       @id @default(cuid())
+  leadId    String       @map("lead_id")
+  type      ActivityType
+  actorId   String?      @map("actor_id") // null = system
+  oldValue  String?      @map("old_value")
+  newValue  String?      @map("new_value")
+  metadata  Json         @default("{}") @map("metadata_json")
+  createdAt DateTime     @default(now()) @map("created_at")
+
+  lead  Lead  @relation(fields: [leadId], references: [id])
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([leadId, createdAt])
+  @@map("lead_activities")
+}
+
+// Transactional outbox + job queue: rows are written in the same DB transaction
+// as the lead, then processed by the worker with retries and backoff.
+model AutomationJob {
+  id             String    @id @default(cuid())
+  organizationId String    @map("organization_id")
+  leadId         String?   @map("lead_id")
+  jobType        JobType   @map("job_type")
+  state          JobState  @default(PENDING)
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(5) @map("max_attempts")
+  nextAttemptAt  DateTime  @default(now()) @map("next_attempt_at")
+  lockedAt       DateTime? @map("locked_at")
+  lastError      String?   @map("last_error")
+  payload        Json      @default("{}")
+  // Guarantees the same job is never created twice (retries, replays, sweeps).
+  idempotencyKey String    @unique @map("idempotency_key")
+  completedAt    DateTime? @map("completed_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  lead         Lead?        @relation(fields: [leadId], references: [id])
+
+  @@index([state, nextAttemptAt])
+  @@index([organizationId, state])
+  @@map("automation_jobs")
+}
+
+model Integration {
+  id                   String              @id @default(cuid())
+  organizationId       String              @map("organization_id")
+  provider             IntegrationProvider
+  enabled              Boolean             @default(false)
+  // AES-256-GCM encrypted JSON (webhook secrets, API keys...). Never plain text.
+  encryptedCredentials String?             @map("encrypted_credentials")
+  configuration        Json                @default("{}") @map("configuration_json")
+  lastSuccessAt        DateTime?           @map("last_success_at")
+  lastErrorAt          DateTime?           @map("last_error_at")
+  lastError            String?             @map("last_error")
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@unique([organizationId, provider])
+  @@map("integrations")
+}
+
+model Consent {
+  id            String   @id @default(cuid())
+  leadId        String   @map("lead_id")
+  consentType   String   @map("consent_type")
+  policyVersion String   @map("policy_version")
+  capturedAt    DateTime @default(now()) @map("captured_at")
+  ipHash        String?  @map("ip_hash")
+
+  lead Lead @relation(fields: [leadId], references: [id])
+
+  @@map("consents")
+}
+
+// Replay protection for signed webhooks.
+model WebhookEvent {
+  id         String   @id @default(cuid())
+  provider   String
+  signature  String   @unique
+  receivedAt DateTime @default(now()) @map("received_at")
+
+  @@map("webhook_events")
+}
+
+model SecurityEvent {
+  id             String   @id @default(cuid())
+  organizationId String?  @map("organization_id")
+  actorId        String?  @map("actor_id")
+  type           String
+  detail         Json     @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("security_events")
+}

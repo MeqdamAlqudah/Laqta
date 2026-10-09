@@ -1,0 +1,235 @@
+openapi: 3.1.0
+info:
+  title: LeadFlow API
+  version: "1.0.0"
+  description: |
+    Lead capture and follow-up API (spec section 6).
+    - Every response carries an `x-request-id` header; errors include `requestId`.
+    - Errors use machine-readable codes: VALIDATION_ERROR, UNAUTHENTICATED, FORBIDDEN, NOT_FOUND,
+      CONFLICT, RATE_LIMITED, PAYLOAD_TOO_LARGE, INVALID_SIGNATURE, INTERNAL_ERROR.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Public
+  - name: Staff
+  - name: Integrations
+  - name: Automation
+
+components:
+  securitySchemes:
+    formKey:
+      type: apiKey
+      in: header
+      name: x-leadflow-key
+      description: Public organization form key (identifies the tenant; not a secret).
+    session:
+      type: apiKey
+      in: cookie
+      name: lf_session
+      description: Staff session cookie set by POST /api/auth/login.
+    serviceToken:
+      type: http
+      scheme: bearer
+      description: SERVICE_API_TOKEN for n8n/Make, together with header `x-leadflow-org: <slug>`.
+    cronSecret:
+      type: http
+      scheme: bearer
+      description: CRON_SECRET.
+    signedWebhook:
+      type: apiKey
+      in: header
+      name: x-leadflow-signature
+      description: "sha256=<hex HMAC-SHA256(WEBHOOK_SECRET, `${x-leadflow-timestamp}.${rawBody}`)>; timestamp must be within 300s."
+  schemas:
+    Error:
+      type: object
+      required: [error, requestId]
+      properties:
+        error: { type: string, example: VALIDATION_ERROR }
+        requestId: { type: string, example: req_01J8x }
+        message: { type: string }
+        fields:
+          type: object
+          additionalProperties: { type: string }
+          example: { phone: Enter a valid mobile number }
+    PublicLeadInput:
+      type: object
+      required: [fullName, phone, serviceCode, consent, idempotencyKey]
+      properties:
+        fullName: { type: string, minLength: 2, maxLength: 80 }
+        phone: { type: string, description: "Any format; normalized to E.164 (default country JO)" }
+        email: { type: [string, "null"], format: email }
+        serviceCode: { type: string, example: consultation }
+        preferredAt: { type: [string, "null"], format: date-time }
+        message: { type: [string, "null"], maxLength: 500 }
+        language: { type: string, enum: [en, ar], default: en }
+        consent:
+          type: object
+          required: [accepted]
+          properties:
+            accepted: { type: boolean, const: true }
+            policyVersion: { type: string, example: "2026-10" }
+        idempotencyKey: { type: string, minLength: 8, example: web-2e3d6c1a }
+        utm: { type: object, additionalProperties: { type: string } }
+        website: { type: string, description: Honeypot - must be empty }
+        captchaToken: { type: string, description: Cloudflare Turnstile token when enabled }
+    LeadCreated:
+      type: object
+      properties:
+        leadId: { type: string }
+        reference: { type: string, example: LF-2026-1042 }
+        status: { type: string, example: NEW }
+        message: { type: string, example: Your request was received. }
+    LeadPatch:
+      type: object
+      required: [version]
+      properties:
+        version: { type: integer, description: Version read by the client (optimistic locking) }
+        status: { type: string, enum: [NEW, ASSIGNED, CONTACTED, QUALIFIED, WON, LOST] }
+        ownerId: { type: [string, "null"] }
+        note: { type: string, maxLength: 2000 }
+
+paths:
+  /api/v1/public/leads:
+    post:
+      tags: [Public]
+      summary: Create a public lead (website form)
+      security: [{ formKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PublicLeadInput" }
+      responses:
+        "201": { description: Created (or merged into a recent duplicate), content: { application/json: { schema: { $ref: "#/components/schemas/LeadCreated" } } } }
+        "200": { description: Replay of an idempotency key - original result returned }
+        "401": { description: Unknown form key, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: Payload too large }
+        "422": { description: Validation error, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { description: Rate limited }
+
+  /api/auth/login:
+    post:
+      tags: [Staff]
+      summary: Staff sign-in (sets session cookie)
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { email: { type: string }, password: { type: string } } }
+      responses: { "200": { description: Signed in }, "401": { description: Invalid credentials }, "429": { description: Too many attempts } }
+
+  /api/v1/leads:
+    get:
+      tags: [Staff]
+      summary: List/filter leads (tenant-scoped; agents see own + unassigned)
+      security: [{ session: [] }, { serviceToken: [] }]
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [NEW, ASSIGNED, CONTACTED, QUALIFIED, WON, LOST, OVERDUE] } }
+        - { name: owner, in: query, schema: { type: string }, description: "user id, me, or unassigned" }
+        - { name: service, in: query, schema: { type: string } }
+        - { name: source, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: format, in: query, schema: { type: string, enum: [csv] }, description: CSV export (manager/admin) }
+      responses: { "200": { description: Paged list }, "401": { description: Not signed in } }
+    post:
+      tags: [Staff]
+      summary: Staff creates a lead (phone call / walk-in) through the same pipeline
+      security: [{ session: [] }]
+      responses: { "201": { description: Created } }
+
+  /api/v1/leads/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    get:
+      tags: [Staff]
+      summary: Lead details and timeline
+      security: [{ session: [] }, { serviceToken: [] }]
+      responses: { "200": { description: Lead }, "404": { description: Not found or not visible (logged as security event) } }
+    patch:
+      tags: [Staff]
+      summary: Change owner, status or add a note (optimistic locking)
+      security: [{ session: [] }]
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/LeadPatch" } } } }
+      responses:
+        "200": { description: Updated - returns the new version }
+        "409": { description: Version conflict - reload and retry }
+        "422": { description: Invalid status transition }
+
+  /api/v1/leads/{id}/activities:
+    post:
+      tags: [Staff]
+      summary: Record a call, message or note
+      security: [{ session: [] }, { serviceToken: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, text]
+              properties:
+                type: { type: string, enum: [CALL, MESSAGE, NOTE, EMAIL_SENT] }
+                text: { type: string }
+      responses: { "201": { description: Recorded } }
+
+  /api/v1/leads/{id}/anonymize:
+    post:
+      tags: [Staff]
+      summary: Privacy deletion request - removes personal fields, keeps audit trail (admin)
+      security: [{ session: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Anonymized } }
+
+  /api/v1/webhooks/{provider}:
+    post:
+      tags: [Integrations]
+      summary: Signed channel webhooks (google-forms, meta, whatsapp)
+      security: [{ signedWebhook: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [google-forms, meta, whatsapp] } }
+        - { name: org, in: query, required: true, schema: { type: string }, description: Organization slug }
+        - { name: x-leadflow-timestamp, in: header, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Lead created }
+        "401": { description: Bad or stale signature }
+        "409": { description: Replay detected }
+
+  /api/v1/dashboard/summary:
+    get:
+      tags: [Staff]
+      summary: Pipeline and SLA statistics
+      security: [{ session: [] }]
+      responses: { "200": { description: Aggregated metrics only } }
+
+  /api/v1/integrations/{id}:
+    put:
+      tags: [Integrations]
+      summary: Enable/disable and configure an integration (admin). Secrets are encrypted at rest.
+      security: [{ session: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Saved } }
+
+  /api/v1/integrations/{id}/test:
+    post:
+      tags: [Integrations]
+      summary: Test a configured integration (admin)
+      security: [{ session: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: "{ ok, detail }" } }
+
+  /api/v1/jobs/run:
+    post:
+      tags: [Automation]
+      summary: Run sweeps and process due jobs (for serverless cron)
+      security: [{ cronSecret: [] }]
+      responses: { "200": { description: "{ processed, sweeps }" } }
+
+  /api/v1/jobs/{id}/retry:
+    post:
+      tags: [Automation]
+      summary: Re-queue a dead-letter job (admin)
+      security: [{ session: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Re-queued } }

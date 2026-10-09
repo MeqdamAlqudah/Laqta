@@ -1,0 +1,32 @@
+# Local development services.
+#   postgres -> the primary database (source of truth)
+#   mailpit  -> a fake SMTP server; open http://localhost:8025 to read every email LeadFlow sends
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: leadflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: leadflow
+      POSTGRES_PASSWORD: leadflow
+      POSTGRES_DB: leadflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - leadflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: leadflow-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI
+
+volumes:
+  leadflow-pgdata:
